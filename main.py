@@ -9,7 +9,7 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, R
 from aiogram.filters import Command
 
 # 🔑 Токен
-TOKEN = "ТВОЙ_ТОКЕН"
+TOKEN = "8730730499:AAHD8XSd7DeFidMP1ogi5rJoUOY0erI0psg"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
