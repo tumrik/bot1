@@ -1,199 +1,216 @@
 import asyncio
-import json
 import os
-import time
-import requests
+from datetime import datetime
 
+import asyncpg
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.filters import Command
+from aiogram.types import Message
+from aiogram.filters import CommandStart
 
-# 🔑 Токен
-TOKEN = "8730730499:AAHD8XSd7DeFidMP1ogi5rJoUOY0erI0psg"
+TOKEN = os.getenv("BOT_TOKEN")
+DB_URL = os.getenv("DATABASE_URL")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-DATA_FILE = "users.json"
-COOLDOWN = 10
+db = None
 
-API_URL = "https://earnball.onrender.com"
-SITE_URL = "https://tumrik.github.io/serverrr/"
 
-CHANNELS = [
-    {"id": -1003877994893, "link": "https://t.me/+Hs8CEusLEvc1YjYx"},
-    {"id": -1003981236439, "link": "https://t.me/+-gBUqAHwj7I4Y2My"},
-]
+# ---------------- БД ----------------
+async def init_db():
+    global db
+    db = await asyncpg.create_pool(DB_URL)
 
-# 📁 Данные
-def load_data():
-    if not os.path.exists(DATA_FILE):
-        return {}
-    with open(DATA_FILE, "r") as f:
-        return json.load(f)
+    async with db.acquire() as conn:
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            points INT DEFAULT 0,
+            clicks INT DEFAULT 0,
+            refs INT DEFAULT 0,
+            reg_date TEXT
+        )
+        """)
 
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS offers (
+            id SERIAL PRIMARY KEY,
+            name TEXT,
+            reward INT
+        )
+        """)
 
-def get_user(user_id):
-    data = load_data()
-    user_id = str(user_id)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS conversions (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            offer_id INT,
+            txid TEXT UNIQUE,
+            reward INT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
 
-    if user_id not in data:
-        data[user_id] = {"balance": 0, "last_claim": 0}
-        save_data(data)
 
-    return data[user_id]
+async def get_user(uid):
+    async with db.acquire() as conn:
+        user = await conn.fetchrow(
+            "SELECT * FROM users WHERE user_id=$1", uid
+        )
 
-def add_balance(user_id, amount):
-    data = load_data()
-    user_id = str(user_id)
+        if not user:
+            await conn.execute("""
+                INSERT INTO users(user_id, reg_date)
+                VALUES($1, $2)
+            """, uid, datetime.now().strftime("%Y-%m-%d"))
 
-    if user_id not in data:
-        data[user_id] = {"balance": 0, "last_claim": 0}
+            return await get_user(uid)
 
-    data[user_id]["balance"] += amount
-    save_data(data)
+        return user
 
-def get_balance(user_id):
-    return get_user(user_id)["balance"]
 
-def set_last_claim(user_id):
-    data = load_data()
-    data[str(user_id)]["last_claim"] = time.time()
-    save_data(data)
+async def get_offers():
+    async with db.acquire() as conn:
+        return await conn.fetch("SELECT * FROM offers")
 
-# 🔐 Подписка
-async def check_sub(user_id):
-    for channel in CHANNELS:
-        try:
-            member = await bot.get_chat_member(channel["id"], user_id)
-            if member.status in ["left", "kicked"]:
-                return False
-        except:
-            return False
-    return True
 
-def get_sub_keyboard():
-    buttons = []
+# ---------------- START ----------------
+@dp.message(CommandStart())
+async def start(msg: Message):
+    uid = msg.from_user.id
 
-    for channel in CHANNELS:
-        buttons.append([
-            InlineKeyboardButton(text="📢 Подписаться", url=channel["link"])
-        ])
+    await get_user(uid)
 
-    buttons.append([
-        InlineKeyboardButton(text="✅ Проверить подписку", callback_data="check_sub")
-    ])
+    offers = await get_offers()
 
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-@dp.callback_query(F.data == "check_sub")
-async def check_sub_handler(callback):
-    if await check_sub(callback.from_user.id):
-        await callback.message.answer("✅ Подписка подтверждена!")
-    else:
-        await callback.message.answer("❌ Подпишись на все каналы!")
-
-# 🧠 Клава
-main_keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="💰 Заработать балл")],
-        [KeyboardButton(text="💳 Мой баланс")],
-        [KeyboardButton(text="🛒 Магазин")]
-    ],
-    resize_keyboard=True
-)
-
-# 🚀 СТАРТ (с проверкой click_id)
-@dp.message(Command("start"))
-async def start(message: Message):
-    args = message.text.split()
-
-    # если пришёл с сайта
-    if len(args) > 1:
-        click_id = args[1]
-
-        try:
-            res = requests.get(f"{API_URL}/check/{click_id}").json()
-
-            if res.get("valid"):
-                requests.post(f"{API_URL}/use/{click_id}")
-
-                add_balance(message.from_user.id, 1)
-                set_last_claim(message.from_user.id)
-
-                await message.answer("⭐ Балл начислен!")
-            else:
-                await message.answer("❌ Задание не засчитано")
-
-        except:
-            await message.answer("⚠️ Ошибка проверки")
-
-    # обычный старт
-    if not await check_sub(message.from_user.id):
-        await message.answer("❗ Подпишись:", reply_markup=get_sub_keyboard())
+    if not offers:
+        await msg.answer("⚠️ Пока нет доступных офферов")
         return
 
-    get_user(message.from_user.id)
+    text = "💰 Доступные задания:\n\n"
 
-    await message.answer(
-        "Привет! Зарабатывай баллы 👇",
-        reply_markup=main_keyboard
+    for offer in offers:
+        link = f"https://your-offer.com?subid={uid}&offer_id={offer['id']}"
+        text += f"{offer['name']} (+{offer['reward']})\n{link}\n\n"
+
+    await msg.answer(text)
+
+
+# ---------------- ПРОФИЛЬ ----------------
+@dp.message(F.text == "/profile")
+async def profile(msg: Message):
+    user = await get_user(msg.from_user.id)
+
+    await msg.answer(
+        f"👤 Профиль\n\n"
+        f"Баллы: {user['points']}\n"
+        f"Клики: {user['clicks']}\n"
+        f"Рефералы: {user['refs']}\n"
+        f"Дата: {user['reg_date']}"
     )
 
-# 💰 Заработать
-@dp.message(F.text == "💰 Заработать балл")
-async def earn(message: Message):
-    user = get_user(message.from_user.id)
 
-    if not await check_sub(message.from_user.id):
-        await message.answer("❗ Сначала подпишись!", reply_markup=get_sub_keyboard())
-        return
+# ---------------- СТАТИСТИКА ----------------
+@dp.message(F.text == "/stats")
+async def stats(msg: Message):
+    async with db.acquire() as conn:
 
-    now = time.time()
-    last = user.get("last_claim", 0)
+        total = await conn.fetchval("""
+            SELECT SUM(reward) FROM conversions
+        """)
 
-    if now - last < COOLDOWN:
-        wait = int(COOLDOWN - (now - last))
-        await message.answer(f"⏳ Подожди {wait} сек")
-        return
+        today = await conn.fetchval("""
+            SELECT SUM(reward)
+            FROM conversions
+            WHERE created_at >= CURRENT_DATE
+        """)
 
-    click_id = f"{message.from_user.id}_{int(time.time())}"
+        count = await conn.fetchval("""
+            SELECT COUNT(*) FROM conversions
+        """)
 
-    # создаём задание на сервере
+    await msg.answer(
+        f"📊 Статистика:\n\n"
+        f"💰 Всего заработано: {total or 0}\n"
+        f"📅 Сегодня: {today or 0}\n"
+        f"🔢 Конверсий: {count}"
+    )
+
+
+# ---------------- POSTBACK ----------------
+from fastapi import FastAPI, Request
+
+app = FastAPI()
+
+SECRET = os.getenv("POSTBACK_SECRET", "secret123")
+
+
+@app.get("/postback")
+async def postback(request: Request):
+    data = dict(request.query_params)
+
+    if data.get("key") != SECRET:
+        return {"error": "unauthorized"}
+
+    subid = data.get("subid")
+    status = data.get("status")
+    txid = data.get("txid")
+    offer_id = data.get("offer_id")
+
+    if not subid or not txid or status != "approved":
+        return {"status": "ignored"}
+
+    user_id = int(subid)
+    offer_id = int(offer_id)
+
+    async with db.acquire() as conn:
+
+        # анти-дубликат
+        exists = await conn.fetchrow(
+            "SELECT * FROM conversions WHERE txid=$1", txid
+        )
+
+        if exists:
+            return {"status": "duplicate"}
+
+        offer = await conn.fetchrow(
+            "SELECT * FROM offers WHERE id=$1", offer_id
+        )
+
+        if not offer:
+            return {"error": "no offer"}
+
+        reward = offer["reward"]
+
+        await conn.execute("""
+            INSERT INTO conversions(user_id, offer_id, txid, reward)
+            VALUES($1, $2, $3, $4)
+        """, user_id, offer_id, txid, reward)
+
+        await conn.execute("""
+            UPDATE users
+            SET points = points + $1,
+                clicks = clicks + 1
+            WHERE user_id=$2
+        """, reward, user_id)
+
     try:
-        requests.post(f"{API_URL}/create_click", json={
-            "click_id": click_id,
-            "user_id": message.from_user.id
-        })
+        await bot.send_message(
+            user_id,
+            f"✅ +{reward} баллов начислено!"
+        )
     except:
-        await message.answer("⚠️ Ошибка сервера")
-        return
+        pass
 
-    task_link = f"{SITE_URL}?click_id={click_id}"
+    return {"status": "ok"}
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📲 Перейти", url=task_link)]
-    ])
 
-    await message.answer("📋 Выполни задание:", reply_markup=kb)
-
-# 💳 Баланс
-@dp.message(F.text == "💳 Мой баланс")
-async def balance(message: Message):
-    if not await check_sub(message.from_user.id):
-        await message.answer("❗ Сначала подпишись!", reply_markup=get_sub_keyboard())
-        return
-
-    bal = get_balance(message.from_user.id)
-    await message.answer(f"💰 Баланс: {bal}")
-
-# ▶️ Запуск
-async def main():
-    print("Бот запущен...")
+# ---------------- RUN ----------------
+async def run_bot():
     await dp.start_polling(bot)
 
-if __name__ == "__main__":
-    asyncio.run(main())
+
+@app.on_event("startup")
+async def startup():
+    await init_db()
+    asyncio.create_task(run_bot())
